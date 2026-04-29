@@ -229,6 +229,22 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
 
 
+def preferred_voice_output_extension(platform: str, provider: Optional[str] = None) -> str:
+    """Return the best requested output extension for a platform/provider pair.
+
+    Telegram voice bubbles require OGG/Opus. Providers known to emit native
+    Opus receive an .ogg request directly. Other providers receive .mp3 as a
+    generation intermediate; text_to_speech_tool can convert that intermediate
+    to OGG/Opus and return the converted file_path.
+    """
+    platform_value = str(platform or "").split(".")[-1].lower()
+    provider_value = (provider or _get_provider(_load_tts_config())).lower()
+    native_opus_providers = {"openai", "elevenlabs"}
+    if platform_value == "telegram" and provider_value in native_opus_providers:
+        return ".ogg"
+    return ".mp3"
+
+
 # ===========================================================================
 # ffmpeg Opus conversion (Edge TTS MP3 -> OGG Opus for Telegram)
 # ===========================================================================

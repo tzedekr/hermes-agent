@@ -26,6 +26,7 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import shlex
@@ -76,6 +77,9 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_ELEVENLABS_STT_MODEL = os.getenv("STT_ELEVENLABS_MODEL", "scribe_v1")
+ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
+DEFAULT_MAX_CLOUD_STT_AUDIO_DURATION_SECONDS = 120
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -107,6 +111,15 @@ def _load_stt_config() -> dict:
     try:
         from hermes_cli.config import load_config
         return load_config().get("stt", {})
+    except Exception:
+        return {}
+
+
+def _load_privacy_config() -> dict:
+    """Load the ``privacy`` section from user config, falling back to defaults."""
+    try:
+        from hermes_cli.config import load_config
+        return load_config().get("privacy", {}) or {}
     except Exception:
         return {}
 
@@ -260,6 +273,14 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "elevenlabs":
+            if os.getenv("ELEVENLABS_API_KEY"):
+                return "elevenlabs"
+            logger.warning(
+                "STT provider 'elevenlabs' configured but ELEVENLABS_API_KEY not set"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
     # --- Auto-detect (no explicit provider): local > groq > openai > mistral > xai -
@@ -280,11 +301,96 @@ def _get_provider(stt_config: dict) -> str:
     if get_env_value("XAI_API_KEY"):
         logger.info("No local STT available, using xAI Grok STT API")
         return "xai"
+    # Deliberately do not auto-detect ElevenLabs from ELEVENLABS_API_KEY.
+    # Voice notes are sensitive; cloud Scribe STT requires explicit config opt-in.
     return "none"
 
 # ---------------------------------------------------------------------------
 # Shared validation
 # ---------------------------------------------------------------------------
+
+
+def _redact_elevenlabs_secret(text: str) -> str:
+    """Remove ElevenLabs API key material from provider error text."""
+    api_key = os.getenv("ELEVENLABS_API_KEY", "")
+    redacted = str(text)
+    if api_key:
+        redacted = redacted.replace(api_key, "[REDACTED]")
+        if len(api_key) >= 12:
+            redacted = redacted.replace(api_key[:8], "[REDACTED]")
+            redacted = redacted.replace(api_key[-6:], "[REDACTED]")
+    return redacted
+
+
+def _get_audio_duration_seconds(file_path: str) -> Optional[float]:
+    """Return audio duration via ffprobe when available; None if unknown."""
+    ffprobe = _find_binary("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", file_path],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        raw = (json.loads(proc.stdout or "{}").get("format") or {}).get("duration")
+        return float(raw) if raw not in (None, "N/A", "") else None
+    except Exception as exc:
+        logger.debug("Unable to determine audio duration for %s: %s", file_path, exc)
+        return None
+
+
+def _max_cloud_stt_duration_seconds(stt_config: Optional[dict] = None, privacy_config: Optional[dict] = None) -> int:
+    stt_config = stt_config or _load_stt_config()
+    privacy_config = privacy_config or _load_privacy_config()
+    value = (
+        stt_config.get("max_audio_duration_seconds")
+        or privacy_config.get("max_cloud_stt_audio_duration_seconds")
+        or DEFAULT_MAX_CLOUD_STT_AUDIO_DURATION_SECONDS
+    )
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CLOUD_STT_AUDIO_DURATION_SECONDS
+
+
+def _cloud_stt_allowed(privacy_config: Optional[dict] = None) -> bool:
+    privacy_config = privacy_config or _load_privacy_config()
+    return is_truthy_value(privacy_config.get("cloud_stt_allowed", False), default=False)
+
+
+def _validate_cloud_stt_audio(file_path: str, provider_name: str, stt_config: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    """Enforce explicit cloud-STT privacy and max-duration gates."""
+    privacy_config = _load_privacy_config()
+    if not _cloud_stt_allowed(privacy_config):
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"{provider_name} STT requires privacy.cloud_stt_allowed: true",
+        }
+    max_seconds = _max_cloud_stt_duration_seconds(stt_config, privacy_config)
+    duration = _get_audio_duration_seconds(file_path)
+    if max_seconds > 0 and duration is None:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": (
+                f"Unable to determine audio duration for {provider_name} cloud STT; "
+                "install ffprobe or lower the file before retrying"
+            ),
+        }
+    if duration is not None and max_seconds > 0 and duration > max_seconds:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": (
+                f"Audio duration {duration:.1f}s exceeds {provider_name} cloud STT limit "
+                f"of {max_seconds}s"
+            ),
+        }
+    return None
 
 
 def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
@@ -774,6 +880,84 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: ElevenLabs (Scribe STT API)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using ElevenLabs Scribe STT API.
+
+    Requires explicit ``stt.provider: elevenlabs`` and ``privacy.cloud_stt_allowed``.
+    The API key alone never opts voice notes into cloud transcription.
+    """
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
+
+    stt_config = _load_stt_config()
+    cloud_error = _validate_cloud_stt_audio(file_path, "ElevenLabs", stt_config)
+    if cloud_error:
+        return cloud_error
+
+    eleven_cfg = stt_config.get("elevenlabs", {})
+    base_url = str(eleven_cfg.get("base_url") or ELEVENLABS_STT_BASE_URL).strip().rstrip("/")
+    timeout = float(eleven_cfg.get("timeout_seconds", 45))
+
+    try:
+        import requests
+
+        with open(file_path, "rb") as audio_file:
+            response = requests.post(
+                f"{base_url}/speech-to-text",
+                headers={"xi-api-key": api_key},
+                files={"file": (Path(file_path).name, audio_file)},
+                data={"model_id": model_name},
+                timeout=timeout,
+            )
+
+        if response.status_code != 200:
+            try:
+                payload = response.json()
+                detail_obj = payload.get("detail") if isinstance(payload, dict) else payload
+                if isinstance(detail_obj, dict):
+                    detail = detail_obj.get("message") or detail_obj.get("status") or str(detail_obj)
+                else:
+                    detail = str(detail_obj)
+            except Exception:
+                detail = response.text[:300]
+            return {
+                "success": False,
+                "transcript": "",
+                "error": _redact_elevenlabs_secret(
+                    f"ElevenLabs STT API error (HTTP {response.status_code}): {detail}"
+                ),
+            }
+
+        result = response.json()
+        transcript_text = _extract_transcript_text(result)
+        if not transcript_text:
+            return {"success": False, "transcript": "", "error": "ElevenLabs STT returned empty transcript"}
+
+        logger.info(
+            "Transcribed %s via ElevenLabs Scribe (%s, %d chars)",
+            Path(file_path).name,
+            model_name,
+            len(transcript_text),
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "elevenlabs"}
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("ElevenLabs STT transcription failed: %s", _redact_elevenlabs_secret(str(e)), exc_info=True)
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"ElevenLabs STT transcription failed: {_redact_elevenlabs_secret(str(e))}",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -846,6 +1030,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
 
+    if provider == "elevenlabs":
+        eleven_cfg = stt_config.get("elevenlabs", {})
+        model_name = model or eleven_cfg.get("model", DEFAULT_ELEVENLABS_STT_MODEL)
+        return _transcribe_elevenlabs(file_path, model_name)
+
     # No provider available
     return {
         "success": False,
@@ -854,8 +1043,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
-            "or OPENAI_API_KEY for the OpenAI Whisper API."
+            "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, set ELEVENLABS_API_KEY "
+            "with stt.provider: elevenlabs and privacy.cloud_stt_allowed: true for ElevenLabs "
+            "Scribe, or set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }
 

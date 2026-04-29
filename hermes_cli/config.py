@@ -452,6 +452,55 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
     },
+
+    # Provider-agnostic advisory routing. The router emits model/reasoning tiers
+    # and policy IDs; concrete provider/model bindings stay in config and are
+    # not injected into prompt prose. Default dry_run records metadata only.
+    "routing": {
+        "enabled": True,
+        "mode": "dry_run",  # dry_run | enforce (reserved; runtime remains authoritative)
+        "schema": "hermes.routing.v1",
+        "policy_registry_version": "1.0.0",
+        "tiers": {
+            "fast": {
+                "provider": "",
+                "model": "",
+                "reasoning_effort": "none",
+                "service_tier": "",
+            },
+            "balanced": {
+                "provider": "",
+                "model": "",
+                "reasoning_effort": "medium",
+                "service_tier": "",
+            },
+            "deep": {
+                "provider": "",
+                "model": "",
+                "reasoning_effort": "xhigh",
+                "service_tier": "",
+            },
+            "custodial_direct": {
+                "provider": "",
+                "model": "",
+                "reasoning_effort": "xhigh",
+                "service_tier": "",
+                "allow_fallback": False,
+            },
+            "local_fast": {
+                "provider": "",
+                "model": "",
+                "reasoning_effort": "none",
+                "service_tier": "",
+            },
+            "local_deep": {
+                "provider": "",
+                "model": "",
+                "reasoning_effort": "high",
+                "service_tier": "",
+            },
+        },
+    },
     
     "terminal": {
         "backend": "local",

@@ -13,7 +13,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from agent.codex_responses_adapter import _chat_messages_to_responses_input, _normalize_codex_response, _preflight_codex_input_items
@@ -2209,6 +2209,90 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_routing_dry_run_metadata_is_returned_without_changing_runtime(self, agent):
+        self._setup_agent(agent)
+        agent.routing_config = {
+            "enabled": True,
+            "mode": "dry_run",
+            "tiers": {
+                "deep": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-opus-4.6",
+                    "reasoning_effort": "xhigh",
+                }
+            },
+        }
+        agent.model = "current-model"
+        agent.provider = "current-provider"
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("/deep Design the migration framework")
+
+        assert result["final_response"] == "Final answer"
+        assert result["routing"]["mode"] == "dry_run"
+        assert result["routing"]["recommendation"]["model_tier"] == "deep"
+        assert result["routing"]["resolved_binding"] == {
+            "model_tier": "deep",
+            "provider": "openrouter",
+            "model": "anthropic/claude-opus-4.6",
+            "reasoning_effort": "xhigh",
+        }
+        assert result["routing"]["outcome"] == {
+            "applied": False,
+            "reason": "dry_run_metadata_only",
+            "model": "current-model",
+            "provider": "current-provider",
+            "reasoning_config": {"enabled": True, "effort": "medium"},
+        }
+        assert agent.model == "current-model"
+        assert agent.provider == "current-provider"
+        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+
+    def test_routing_uses_raw_prompt_not_log_summary(self, agent):
+        self._setup_agent(agent)
+        agent.routing_config = {"enabled": True, "mode": "dry_run"}
+        long_message = "send customer email " + ("x" * 700)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        metadata = {"mode": "dry_run", "recommendation": {}, "outcome": {"applied": False}}
+
+        with (
+            patch.object(run_agent, "build_routing_metadata", return_value=metadata) as build_metadata,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(long_message)
+
+        assert result["routing"] is metadata
+        assert build_metadata.call_args.args[0] == long_message
+
+    def test_routing_metadata_failure_logs_warning_and_turn_continues(self, agent):
+        self._setup_agent(agent)
+        agent.routing_config = {"enabled": True, "mode": "dry_run"}
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(run_agent, "build_routing_metadata", side_effect=RuntimeError("boom")),
+            patch.object(run_agent.logger, "warning") as warning,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("/deep Design the migration framework")
+
+        assert result["final_response"] == "Final answer"
+        assert "routing" not in result
+        warning.assert_any_call("advisory routing metadata failed: %s: %s", "RuntimeError", ANY)
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

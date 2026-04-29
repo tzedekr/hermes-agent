@@ -23,6 +23,10 @@ from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
+# Base platform auto-TTS historically allowed longer narrated replies. The
+# GatewayRunner path uses its own shorter cap for live voice-reply UX.
+BASE_AUTO_TTS_REPLY_MAX_CHARS = 4000
+
 
 def utf16_len(s: str) -> int:
     """Count UTF-16 code units in *s*.
@@ -2441,7 +2445,7 @@ class BasePlatformAdapter(ABC):
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:BASE_AUTO_TTS_REPLY_MAX_CHARS].strip()
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
                             tts_result_str = await asyncio.to_thread(

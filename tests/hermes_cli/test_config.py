@@ -635,6 +635,21 @@ class TestDiscordChannelPromptsConfig:
     def test_default_config_includes_discord_channel_prompts(self):
         assert DEFAULT_CONFIG["discord"]["channel_prompts"] == {}
 
+    def test_default_routing_config_is_dry_run_and_provider_agnostic(self):
+        routing = DEFAULT_CONFIG["routing"]
+
+        assert routing["enabled"] is True
+        assert routing["mode"] == "dry_run"
+        assert routing["schema"] == "hermes.routing.v1"
+        assert set(routing["tiers"]) >= {"fast", "balanced", "deep", "custodial_direct"}
+        assert routing["tiers"]["fast"]["reasoning_effort"] == "none"
+        assert routing["tiers"]["deep"]["reasoning_effort"] == "xhigh"
+        assert routing["tiers"]["custodial_direct"]["allow_fallback"] is False
+        assert all(
+            "provider" in binding and "model" in binding
+            for binding in routing["tiers"].values()
+        )
+
     def test_migrate_adds_discord_channel_prompts_default(self, tmp_path):
         config_path = tmp_path / "config.yaml"
         config_path.write_text(

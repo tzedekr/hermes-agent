@@ -4,7 +4,6 @@ import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'rea
 
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
-import { cursorLayout } from '../lib/inputMetrics.js'
 import { isActionMod, isMac, isMacActionFallback } from '../lib/platform.js'
 
 type InkExt = typeof Ink & {
@@ -170,6 +169,119 @@ export function lineNav(s: string, p: number, dir: -1 | 1): null | number {
   return snapPos(s, Math.min(nextBreak + 1 + col, lineEnd))
 }
 
+type LayoutStop = { column: number; line: number; offset: number }
+
+const isSoftWrapWhitespace = (segment: string) => /\s/u.test(segment) && segment !== '\n'
+
+function layoutStops(value: string, cols: number) {
+  const w = Math.max(1, cols)
+  const segments = Array.from(seg().segment(value), part => ({
+    end: part.index + part.segment.length,
+    index: part.index,
+    segment: part.segment,
+    width: Math.max(0, stringWidth(part.segment))
+  }))
+  const stops: LayoutStop[] = [{ column: 0, line: 0, offset: 0 }]
+  let column = 0
+  let line = 0
+  let i = 0
+
+  const addStop = (offset: number) => {
+    stops.push({ column, line, offset })
+  }
+
+  const renderSegment = (part: (typeof segments)[number]) => {
+    if (part.segment === '\n') {
+      line++
+      column = 0
+      addStop(part.end)
+
+      return
+    }
+
+    const width = part.width
+    if (!width) {
+      addStop(part.end)
+
+      return
+    }
+
+    if (column + width > w) {
+      line++
+      column = 0
+      addStop(part.index)
+    }
+
+    column += width
+    addStop(part.end)
+  }
+
+  while (i < segments.length) {
+    const part = segments[i]!
+
+    if (part.segment === '\n' || isSoftWrapWhitespace(part.segment)) {
+      renderSegment(part)
+      i++
+
+      continue
+    }
+
+    let j = i
+    let wordWidth = 0
+
+    while (
+      j < segments.length &&
+      segments[j]!.segment !== '\n' &&
+      !isSoftWrapWhitespace(segments[j]!.segment)
+    ) {
+      wordWidth += segments[j]!.width
+      j++
+    }
+
+    // Match Ink's normal wrap mode: prefer moving an overflowing word to the
+    // next row, but still hard-wrap words longer than the available row.
+    if (column > 0 && wordWidth > 0 && column + wordWidth > w) {
+      line++
+      column = 0
+      addStop(part.index)
+    }
+
+    while (i < j) {
+      renderSegment(segments[i]!)
+      i++
+    }
+  }
+
+  return stops
+}
+
+// Mirrors Ink's normal <Text wrap="wrap"> behaviour: word wrap first, then
+// hard-wrap single words that are longer than the available input width. This
+// keeps normal prose from being chopped in half at the right margin.
+export function cursorLayout(value: string, cursor: number, cols: number) {
+  const pos = Math.max(0, Math.min(cursor, value.length))
+  const stops = layoutStops(value, cols)
+  const firstAtOrAfter = stops.findIndex(item => item.offset >= pos)
+  let stop = firstAtOrAfter >= 0 ? stops[firstAtOrAfter]! : { column: 0, line: 0, offset: pos }
+
+  // Duplicate offsets can represent both sides of a wrap boundary. If the
+  // pre-wrap cursor cell would overflow while more text follows, prefer the
+  // post-wrap visual stop. For soft word-wrap after whitespace, keep the
+  // pre-wrap whitespace stop so row/column maps back naturally.
+  if (stop.offset === pos && pos < value.length && stop.column >= Math.max(1, cols)) {
+    for (let i = firstAtOrAfter + 1; i < stops.length && stops[i]!.offset === pos; i++) {
+      stop = stops[i]!
+    }
+  }
+
+  // A trailing cursor-cell overflows to the next row at the wrap column.
+  if (pos === value.length && stop.column >= Math.max(1, cols)) {
+    return { column: 0, line: stop.line + 1 }
+  }
+
+  return { column: stop.column, line: stop.line }
+}
+
 export function offsetFromPosition(value: string, row: number, col: number, cols: number) {
   if (!value.length) {
     return 0
@@ -177,49 +289,24 @@ export function offsetFromPosition(value: string, row: number, col: number, cols
 
   const targetRow = Math.max(0, Math.floor(row))
   const targetCol = Math.max(0, Math.floor(col))
-  const w = Math.max(1, cols)
+  const stops = layoutStops(value, cols)
+  let lastOnTarget: LayoutStop | null = null
 
-  let line = 0
-  let column = 0
-  let lastOffset = 0
+  for (const stop of stops) {
+    if (stop.line > targetRow) {
+      return lastOnTarget?.offset ?? stop.offset
+    }
 
-  for (const { segment, index } of seg().segment(value)) {
-    lastOffset = index
-
-    if (segment === '\n') {
-      if (line === targetRow) {
-        return index
+    if (stop.line === targetRow) {
+      if (stop.column >= targetCol) {
+        return stop.offset
       }
 
-      line++
-      column = 0
-
-      continue
+      lastOnTarget = stop
     }
-
-    const sw = Math.max(1, stringWidth(segment))
-
-    if (column + sw > w) {
-      if (line === targetRow) {
-        return index
-      }
-
-      line++
-      column = 0
-    }
-
-    if (line === targetRow && targetCol <= column + Math.max(0, sw - 1)) {
-      return index
-    }
-
-    column += sw
   }
 
-  if (targetRow >= line) {
-    return value.length
-  }
-
-  return lastOffset
+  return lastOnTarget?.offset ?? value.length
 }
 
 function renderWithCursor(value: string, cursor: number) {
@@ -1059,7 +1146,7 @@ export function TextInput({
       ref={boxRef}
       width={columns}
     >
-      <Text wrap="wrap-char">{rendered}</Text>
+      <Text wrap="wrap">{rendered}</Text>
     </Box>
   )
 }

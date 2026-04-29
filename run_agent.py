@@ -32,6 +32,7 @@ import os
 import random
 import re
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -159,6 +160,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.routing import build_routing_metadata
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 from hermes_cli.config import cfg_get
 
@@ -916,6 +918,7 @@ class AIAgent:
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
+        routing_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
@@ -1180,6 +1183,16 @@ class AIAgent:
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.service_tier = service_tier
         self.request_overrides = dict(request_overrides or {})
+        if routing_config is not None:
+            self.routing_config = dict(routing_config or {})
+        else:
+            try:
+                from hermes_cli.config import load_config as _load_config_for_routing
+
+                self.routing_config = dict((_load_config_for_routing().get("routing") or {}))
+            except Exception as exc:
+                logger.warning("failed to load advisory routing config: %s: %s", type(exc).__name__, exc)
+                self.routing_config = {"enabled": False}
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
         
@@ -1224,6 +1237,12 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+
+        # Claude Code plan-consult state. This is advisory only: it may log a
+        # read-only critique, but it never mutates the assistant message/history
+        # and it must never block tool execution on failure.
+        self._plan_consult_seen_keys: set[str] = set()
+        self._plan_consult_count_by_task: Dict[str, int] = {}
 
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
@@ -8600,6 +8619,208 @@ class AIAgent:
 
         return msg
 
+    def _plan_consult_config(self) -> Dict[str, Any]:
+        """Return duality.plan_consult config, or an empty dict on failure."""
+        try:
+            from hermes_cli.config import load_config as _load_config_for_plan_consult
+
+            cfg = _load_config_for_plan_consult()
+            duality = cfg.get("duality") or {}
+            pc = duality.get("plan_consult") or {}
+            if not duality.get("enabled", False) or not pc.get("enabled", False):
+                return {}
+            return dict(pc)
+        except Exception as exc:
+            logger.debug("plan consult config unavailable: %s: %s", type(exc).__name__, exc)
+            return {}
+
+    def _redact_plan_consult_text(self, text: str, *, max_chars: int = 160) -> str:
+        """Return a bounded, secret-redacted preview for Claude Code consults."""
+        if text is None:
+            return ""
+        value = str(text).replace("\x00", " ")
+        secret_patterns = [
+            r"(?i)\b(api[_-]?key|secret|token|password|passwd|pwd|bearer|private[_-]?key)\b\s*[:=]\s*[^\s,'\"]+",
+            r"\bAKIA[0-9A-Z]{16}\b",
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            r"(?i)\b(postgres|mysql|mongodb|redis)://[^\s]+",
+            r"\b(?:\d[ -]*?){13,19}\b",
+            r"\b\d{3}-\d{2}-\d{4}\b",
+        ]
+        for pattern in secret_patterns:
+            value = re.sub(pattern, "[REDACTED]", value, flags=re.DOTALL)
+        value = " ".join(value.split())
+        if len(value) <= max_chars:
+            return value
+        digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+        return f"{value[:max_chars]}… [truncated sha256:{digest}]"
+
+    def _safe_tool_arg_for_plan_consult(self, tool_name: str, key: str, value: Any) -> str:
+        """Summarize one tool arg without persisting prompt-like or secret content."""
+        key_l = (key or "").lower()
+        tool_l = (tool_name or "").lower()
+        sensitive_keys = {
+            "content", "body", "message", "text", "prompt", "patch", "new_string",
+            "old_string", "code", "file_content", "password", "token", "secret",
+            "api_key", "authorization", "headers",
+        }
+        preview_keys = {
+            "command", "path", "file_path", "workdir", "url", "query", "pattern",
+            "target", "action", "mode", "shape", "name", "schedule", "job_id",
+            "ref", "timezone", "source_timezone", "target_timezone",
+        }
+        if key_l in sensitive_keys or any(s in key_l for s in ("password", "token", "secret", "key")):
+            raw = json.dumps(value, sort_keys=True, default=str) if not isinstance(value, str) else value
+            digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
+            return f"[hashed {len(raw)} chars sha256:{digest}]"
+        if key_l in preview_keys or tool_l in {"terminal", "patch", "write_file", "read_file", "search_files"}:
+            return self._redact_plan_consult_text(value, max_chars=180)
+        if isinstance(value, (int, float, bool)) or value is None:
+            return repr(value)
+        if isinstance(value, (list, tuple, set)):
+            return f"[{len(value)} items]"
+        if isinstance(value, dict):
+            return "{" + ", ".join(sorted(str(k) for k in value.keys())[:12]) + "}"
+        raw = str(value)
+        if len(raw) <= 48:
+            return self._redact_plan_consult_text(raw, max_chars=48)
+        digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
+        return f"[hashed {len(raw)} chars sha256:{digest}]"
+
+    def _tool_calls_plan_summary(self, tool_calls: list) -> tuple[list[str], list[str]]:
+        """Build bounded safe one-line summaries for a batch of tool calls."""
+        summaries: list[str] = []
+        names: list[str] = []
+        for idx, tc in enumerate(tool_calls or [], start=1):
+            fn = (tc or {}).get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+            name = ""
+            raw_args: Any = {}
+            if isinstance(fn, dict):
+                name = str(fn.get("name") or "")
+                raw_args = fn.get("arguments") or "{}"
+            elif fn is not None:
+                name = str(getattr(fn, "name", "") or "")
+                raw_args = getattr(fn, "arguments", "{}") or "{}"
+            names.append(name)
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except Exception:
+                args = {"arguments": "[invalid-json]"}
+            if not isinstance(args, dict):
+                args = {"arguments": args}
+            parts = []
+            for key in sorted(args.keys())[:10]:
+                parts.append(f"{key}={self._safe_tool_arg_for_plan_consult(name, key, args.get(key))}")
+            arg_text = ", ".join(parts) if parts else "no args"
+            summaries.append(f"{idx}. {name}({arg_text})")
+        return summaries, names
+
+    def _plan_consult_local_skip_reason(self, tool_names: list[str]) -> Optional[str]:
+        """Cheap local skips for sensitive side effects before invoking Claude."""
+        if not tool_names:
+            return "no tool calls"
+        names = {(n or "").lower() for n in tool_names}
+        housekeeping = {"memory", "todo", "skill_manage", "session_search"}
+        if names and names.issubset(housekeeping):
+            return "housekeeping-only tool batch"
+        sensitive_prefixes = (
+            "mcp_outlook_send_email", "mcp_outlook_reply_email", "mcp_outlook_draft_email",
+            "mcp_outlook_create_event", "mcp_outlook_cancel_event", "mcp_outlook_delete_event",
+            "mcp_todoist_add_", "mcp_todoist_update_", "mcp_todoist_delete_",
+            "mcp_todoist_complete_", "mcp_todoist_uncomplete_", "mcp_todoist_reschedule_",
+        )
+        sensitive_exact = {"send_message", "cronjob", "memory"}
+        for name in names:
+            if name in sensitive_exact or any(name.startswith(prefix) for prefix in sensitive_prefixes):
+                return f"sensitive side-effect tool: {name}"
+        return None
+
+    def _plan_consult_key(self, tool_names: list[str], summaries: list[str], task_id: Any) -> str:
+        raw = json.dumps({
+            "task_id": str(task_id or "default"),
+            "tools": tool_names,
+            "summaries": summaries,
+        }, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    def _maybe_run_plan_consult(self, assistant_msg: dict, effective_task_id: Any) -> None:
+        """Run configured Claude Code plan consult before dispatching a tool batch.
+
+        Fail-open by design: skipped/failed/timeout consults never prevent normal
+        Hermes execution. Consult output is displayed/logged out-of-band and is
+        not appended to the model-visible conversation.
+        """
+        pc = self._plan_consult_config()
+        if not pc:
+            return
+        kill_switch = pc.get("kill_switch_env") or "HERMES_NO_CONSULT"
+        inflight_env = pc.get("inflight_env") or "HERMES_PLAN_CONSULT_INFLIGHT"
+        if os.environ.get(kill_switch) or os.environ.get(inflight_env):
+            return
+        tool_calls = assistant_msg.get("tool_calls") or []
+        summaries, names = self._tool_calls_plan_summary(tool_calls)
+        skip_reason = self._plan_consult_local_skip_reason(names)
+        if skip_reason:
+            logger.debug("plan consult skipped locally: %s", skip_reason)
+            return
+        task_key = str(effective_task_id or getattr(self, "session_id", None) or "default")
+        max_per_task = int(pc.get("max_consults_per_task") or 1)
+        if self._plan_consult_count_by_task.get(task_key, 0) >= max_per_task:
+            return
+        consult_key = self._plan_consult_key(names, summaries, task_key)
+        if consult_key in self._plan_consult_seen_keys:
+            return
+        self._plan_consult_seen_keys.add(consult_key)
+
+        helper = str(pc.get("helper") or "").strip()
+        if not helper or not os.path.exists(os.path.expanduser(helper)):
+            logger.debug("plan consult helper missing: %s", helper)
+            return
+        helper = os.path.expanduser(helper)
+        plan_text = "\n".join([
+            "Hermes is about to dispatch this tool batch. Review only for safety, completeness, and likely failure modes.",
+            "Do not ask to execute anything; Hermes will continue unless a human/operator acts on this advisory.",
+            "",
+            "Tool batch:",
+            *summaries,
+        ]).strip()
+        timeout = int(pc.get("timeout") or 180)
+        title = f"auto tool-dispatch consult: {', '.join(names[:4])}"
+        cmd = [helper, "--title", title[:120], "--trigger", "automatic pre-dispatch tool batch", "--format", "json", "--timeout", str(timeout)]
+        env = os.environ.copy()
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=plan_text,
+                text=True,
+                capture_output=True,
+                timeout=timeout + 10,
+                env=env,
+                cwd=os.getcwd(),
+            )
+        except subprocess.TimeoutExpired:
+            self._vprint(f"{self.log_prefix}⚠️  Claude plan consult timed out; continuing.")
+            return
+        except Exception as exc:
+            logger.debug("plan consult invocation failed: %s: %s", type(exc).__name__, exc)
+            return
+        if proc.returncode != 0:
+            logger.debug("plan consult exited %s: %s", proc.returncode, (proc.stderr or "")[:300])
+            return
+        try:
+            payload = json.loads(proc.stdout or "{}")
+        except Exception:
+            logger.debug("plan consult returned non-json: %s", (proc.stdout or "")[:300])
+            return
+        status = payload.get("status")
+        reason = payload.get("reason")
+        if status == "consulted":
+            self._plan_consult_count_by_task[task_key] = self._plan_consult_count_by_task.get(task_key, 0) + 1
+            result = self._redact_plan_consult_text(payload.get("result") or "", max_chars=500)
+            self._vprint(f"{self.log_prefix}🧠 Claude plan consult: {result}", force=True)
+        elif status in {"skipped", "error"}:
+            logger.debug("plan consult %s: %s", status, reason)
+
     def _needs_kimi_tool_reasoning(self) -> bool:
         """Return True when the current provider is Kimi / Moonshot thinking mode.
 
@@ -10192,6 +10413,21 @@ class AIAgent:
 
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
+
+        # Advisory routing metadata is dry-run only here: it records how the
+        # prompt would be classified without mutating provider/model/reasoning.
+        turn_routing_metadata = None
+        try:
+            turn_routing_metadata = build_routing_metadata(
+                original_user_message,
+                source_platform=self.platform or "cli",
+                routing_config=getattr(self, "routing_config", None),
+                model=self.model,
+                provider=self.provider,
+                reasoning_config=self.reasoning_config,
+            )
+        except Exception as exc:
+            logger.warning("advisory routing metadata failed: %s: %s", type(exc).__name__, exc)
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
@@ -12879,6 +13115,8 @@ class AIAgent:
                     # a LATER tool round.
                     self._post_tool_empty_retried = False
 
+                    self._maybe_run_plan_consult(assistant_msg, effective_task_id)
+
                     messages.append(assistant_msg)
                     self._emit_interim_assistant_message(assistant_msg)
 
@@ -13441,6 +13679,8 @@ class AIAgent:
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
         }
+        if turn_routing_metadata:
+            result["routing"] = turn_routing_metadata
         # If a /steer landed after the final assistant turn (no more tool
         # batches to drain into), hand it back to the caller so it can be
         # delivered as the next user turn instead of being silently lost.
