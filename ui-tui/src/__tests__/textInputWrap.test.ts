@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { offsetFromPosition } from '../components/textInput.js'
 import { composerPromptWidth, cursorLayout, inputVisualHeight, stableComposerColumns } from '../lib/inputMetrics.js'
 
-describe('cursorLayout — word-wrap parity with wrap-ansi', () => {
+describe('cursorLayout — word-wrap parity with Ink wrap mode', () => {
   it('places cursor mid-line at its column', () => {
     expect(cursorLayout('hello world', 6, 40)).toEqual({ column: 6, line: 0 })
   })
@@ -18,13 +18,20 @@ describe('cursorLayout — word-wrap parity with wrap-ansi', () => {
     expect(cursorLayout('abcdefgh', 8, 8)).toEqual({ column: 0, line: 1 })
   })
 
-  it('moves words across wrap boundaries instead of splitting them', () => {
-    // With wordWrap:true, "hello wor" at cols=8 is "hello \nwor" rather
-    // than "hello wo\nr".
+  it('moves an overflowing word to the next line instead of splitting it', () => {
+    // Normal prose should wrap as "hello \nworld", not "hello wo\nrld".
     expect(cursorLayout('hello wo', 8, 8)).toEqual({ column: 0, line: 1 })
     expect(cursorLayout('hello wor', 9, 8)).toEqual({ column: 3, line: 1 })
     expect(cursorLayout('hello worl', 10, 8)).toEqual({ column: 4, line: 1 })
     expect(cursorLayout('hello world', 11, 8)).toEqual({ column: 5, line: 1 })
+  })
+
+  it('moves the cursor to the next row at a hard-wrap boundary before more text', () => {
+    expect(cursorLayout('abcdefghi', 8, 8)).toEqual({ column: 0, line: 1 })
+  })
+
+  it('keeps the cursor stop for whitespace before a moved word', () => {
+    expect(cursorLayout('hello wor', 6, 8)).toEqual({ column: 6, line: 0 })
   })
 
   it('wraps the next word instead of splitting it at the right edge', () => {
@@ -93,6 +100,10 @@ describe('offsetFromPosition — word-wrap inverse of cursorLayout', () => {
 
     expect(offsetFromPosition(text, 1, 0, 70)).toBe(text.indexOf('wish'))
     expect(offsetFromPosition(text, 1, 3, 70)).toBe(text.indexOf('wish') + 3)
+  })
+
+  it('maps clicks on whitespace before a moved word', () => {
+    expect(offsetFromPosition('hello wor', 0, 6, 8)).toBe(6)
   })
 
   it('maps clicks past a \\n into the target line', () => {

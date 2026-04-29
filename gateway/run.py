@@ -42,6 +42,10 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from hermes_cli.config import cfg_get
 
+# GatewayRunner voice replies are sent before the text reply in live chat; keep
+# the historical shorter cap to avoid unexpectedly long/costly voice messages.
+RUNNER_AUTO_TTS_REPLY_MAX_CHARS = 900
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
@@ -215,6 +219,10 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
         return None
     return None
 
+
+# Keep automatic voice replies short enough for responsive gateway delivery and
+# provider character limits; the full text reply is still sent separately.
+AUTO_TTS_REPLY_MAX_CHARS = 900
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -8642,17 +8650,24 @@ class GatewayRunner:
         audio_path = None
         actual_path = None
         try:
-            from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+            from tools.tts_tool import (
+                text_to_speech_tool,
+                _strip_markdown_for_tts,
+                preferred_voice_output_extension,
+            )
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            tts_text = _strip_markdown_for_tts(text[:RUNNER_AUTO_TTS_REPLY_MAX_CHARS])
             if not tts_text:
                 return
 
-            # Use .mp3 extension so edge-tts conversion to opus works correctly.
-            # The TTS tool may convert to .ogg — use file_path from result.
+            # Telegram voice bubbles require Opus. Providers that can emit
+            # Opus natively should receive .ogg; Edge/local providers receive
+            # .mp3 and may return a converted .ogg path after generation.
+            _platform_raw = getattr(event.source.platform, "value", None) or getattr(event.source.platform, "name", None) or event.source.platform
+            _voice_ext = preferred_voice_output_extension(str(_platform_raw))
             audio_path = os.path.join(
                 tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.mp3",
+                f"tts_reply_{_uuid.uuid4().hex[:12]}{_voice_ext}",
             )
             os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
