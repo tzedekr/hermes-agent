@@ -1052,13 +1052,20 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
+        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "elevenlabs" (Scribe) | "mistral" (Voxtral Transcribe)
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+        },
+        "elevenlabs": {
+            "model": "scribe_v1",  # ElevenLabs Scribe STT
+            "language_code": "",  # auto-detect by default; set to "en", "es", etc. to force
+            "tag_audio_events": False,
+            "diarize": False,
+            "timestamps_granularity": "none",  # none, word, character
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602

@@ -8,6 +8,8 @@ end-to-end dispatch.  All external dependencies are mocked.
 import os
 import struct
 import subprocess
+import sys
+import types
 import wave
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +51,8 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
 
@@ -114,6 +118,27 @@ class TestGetProviderFallbackPriority:
     def test_unknown_provider_passed_through(self):
         from tools.transcription_tools import _get_provider
         assert _get_provider({"provider": "custom-endpoint"}) == "custom-endpoint"
+
+    def test_explicit_elevenlabs_with_key(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "xi-test")
+        with patch("tools.transcription_tools._HAS_ELEVENLABS", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "elevenlabs"}) == "elevenlabs"
+
+    def test_explicit_elevenlabs_no_key_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+        with patch("tools.transcription_tools._HAS_ELEVENLABS", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "elevenlabs"}) == "none"
+
+    def test_auto_detect_uses_elevenlabs_after_openai(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "xi-test")
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._has_local_command", return_value=False), \
+             patch("tools.transcription_tools._HAS_OPENAI", False), \
+             patch("tools.transcription_tools._HAS_ELEVENLABS", True):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({}) == "elevenlabs"
 
     def test_empty_config_defaults_to_local(self):
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
@@ -1328,6 +1353,27 @@ class TestGetProviderXAI:
 
 
 # ============================================================================
+# transcribe_audio — ElevenLabs dispatch
+# ============================================================================
+
+class TestTranscribeAudioElevenLabsDispatch:
+    def test_dispatches_to_elevenlabs(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={
+            "provider": "elevenlabs",
+            "elevenlabs": {"model": "scribe_v1"},
+        }), \
+             patch("tools.transcription_tools._get_provider", return_value="elevenlabs"), \
+             patch("tools.transcription_tools._transcribe_elevenlabs",
+                   return_value={"success": True, "transcript": "hi", "provider": "elevenlabs"}) as mock_elevenlabs:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["provider"] == "elevenlabs"
+        mock_elevenlabs.assert_called_once_with(sample_ogg, "scribe_v1")
+
+
+# ============================================================================
 # transcribe_audio — xAI dispatch
 # ============================================================================
 
@@ -1363,6 +1409,65 @@ class TestTranscribeAudioXAIDispatch:
             transcribe_audio(sample_ogg, model="custom-stt")
 
         assert mock_xai.call_args[0][1] == "custom-stt"
+
+
+# ============================================================================
+# _transcribe_elevenlabs
+# ============================================================================
+
+class TestTranscribeElevenLabs:
+    def test_no_key(self, monkeypatch):
+        monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+        from tools.transcription_tools import _transcribe_elevenlabs
+        result = _transcribe_elevenlabs("/tmp/test.ogg", "scribe_v1")
+        assert result["success"] is False
+        assert "ELEVENLABS_API_KEY" in result["error"]
+
+    def test_package_not_installed(self, monkeypatch):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "xi-test")
+        with patch("tools.transcription_tools._HAS_ELEVENLABS", False):
+            from tools.transcription_tools import _transcribe_elevenlabs
+            result = _transcribe_elevenlabs("/tmp/test.ogg", "scribe_v1")
+        assert result["success"] is False
+        assert "elevenlabs package" in result["error"]
+
+    def test_successful_transcription(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("ELEVENLABS_API_KEY", "xi-test")
+
+        response = MagicMock()
+        response.text = "  hello from scribe  "
+        mock_client = MagicMock()
+        mock_client.speech_to_text.convert.return_value = response
+
+        elevenlabs_module = types.ModuleType("elevenlabs")
+        elevenlabs_client_module = types.ModuleType("elevenlabs.client")
+        elevenlabs_client_module.ElevenLabs = MagicMock(return_value=mock_client)
+
+        with patch.dict(sys.modules, {
+                 "elevenlabs": elevenlabs_module,
+                 "elevenlabs.client": elevenlabs_client_module,
+             }), \
+             patch("tools.transcription_tools._HAS_ELEVENLABS", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "elevenlabs": {
+                     "language_code": "en",
+                     "tag_audio_events": False,
+                     "diarize": False,
+                     "timeout_seconds": 45,
+                 }
+             }):
+            from tools.transcription_tools import _transcribe_elevenlabs
+            result = _transcribe_elevenlabs(sample_wav, "scribe_v1")
+
+        assert result == {
+            "success": True,
+            "transcript": "hello from scribe",
+            "provider": "elevenlabs",
+        }
+        kwargs = mock_client.speech_to_text.convert.call_args.kwargs
+        assert kwargs["model_id"] == "scribe_v1"
+        assert kwargs["language_code"] == "en"
+        assert kwargs["request_options"] == {"timeout_in_seconds": 45}
 
 
 # ============================================================================

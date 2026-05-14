@@ -2,13 +2,14 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with seven providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
   - **groq** (free tier) — Groq Whisper API, requires ``GROQ_API_KEY``.
   - **openai** (paid) — OpenAI Whisper API, requires ``VOICE_TOOLS_OPENAI_KEY``.
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
+  - **elevenlabs** — ElevenLabs Scribe STT API, requires ``ELEVENLABS_API_KEY``.
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
 
@@ -73,6 +74,7 @@ def _safe_find_spec(module_name: str) -> bool:
 _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
 _HAS_OPENAI = _safe_find_spec("openai")
 _HAS_MISTRAL = _safe_find_spec("mistralai")
+_HAS_ELEVENLABS = _safe_find_spec("elevenlabs")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -84,6 +86,7 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_ELEVENLABS_STT_MODEL = os.getenv("STT_ELEVENLABS_MODEL", "scribe_v1")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -202,7 +205,7 @@ def _get_provider(stt_config: dict) -> str:
 
     When ``stt.provider`` is explicitly set in config, that choice is
     honoured — no silent cloud fallback.  When no provider is configured,
-    auto-detect tries: local > groq (free) > openai (paid).
+    auto-detect tries: local > groq (free) > openai (paid) > elevenlabs (paid) > xai.
     """
     if not is_stt_enabled(stt_config):
         return "none"
@@ -265,6 +268,15 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "elevenlabs":
+            if _HAS_ELEVENLABS and get_env_value("ELEVENLABS_API_KEY"):
+                return "elevenlabs"
+            logger.warning(
+                "STT provider 'elevenlabs' configured but ELEVENLABS_API_KEY "
+                "is not set or the elevenlabs package is not installed"
+            )
+            return "none"
+
         if provider == "xai":
             if get_env_value("XAI_API_KEY"):
                 return "xai"
@@ -275,7 +287,7 @@ def _get_provider(stt_config: dict) -> str:
 
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > xai ---
+    # --- Auto-detect (no explicit provider): local > groq > openai > elevenlabs > xai ---
     # mistral is intentionally skipped while `mistralai` is quarantined on
     # PyPI (malicious 2.4.6 release on 2026-05-12).
 
@@ -289,6 +301,9 @@ def _get_provider(stt_config: dict) -> str:
     if _HAS_OPENAI and _has_openai_audio_backend():
         logger.info("No local STT available, using OpenAI Whisper API")
         return "openai"
+    if _HAS_ELEVENLABS and get_env_value("ELEVENLABS_API_KEY"):
+        logger.info("No local STT available, using ElevenLabs Scribe API")
+        return "elevenlabs"
     if get_env_value("XAI_API_KEY"):
         logger.info("No local STT available, using xAI Grok STT API")
         return "xai"
@@ -693,6 +708,75 @@ def _transcribe_mistral(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: ElevenLabs (Scribe STT API)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using ElevenLabs Scribe STT API."""
+    api_key = get_env_value("ELEVENLABS_API_KEY")
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
+
+    if not _HAS_ELEVENLABS:
+        return {"success": False, "transcript": "", "error": "elevenlabs package not installed"}
+
+    stt_config = _load_stt_config()
+    elevenlabs_config = stt_config.get("elevenlabs", {})
+    language_code = str(elevenlabs_config.get("language_code", "") or "").strip()
+    timestamps_granularity = str(
+        elevenlabs_config.get("timestamps_granularity", "none") or "none"
+    ).strip()
+
+    convert_kwargs: Dict[str, Any] = {
+        "model_id": model_name,
+        "tag_audio_events": is_truthy_value(elevenlabs_config.get("tag_audio_events", False)),
+        "diarize": is_truthy_value(elevenlabs_config.get("diarize", False)),
+    }
+    if language_code:
+        convert_kwargs["language_code"] = language_code
+    if timestamps_granularity:
+        convert_kwargs["timestamps_granularity"] = timestamps_granularity
+    if elevenlabs_config.get("num_speakers"):
+        try:
+            convert_kwargs["num_speakers"] = int(elevenlabs_config["num_speakers"])
+        except (TypeError, ValueError):
+            logger.warning("Invalid stt.elevenlabs.num_speakers value; omitting it")
+    if elevenlabs_config.get("timeout_seconds"):
+        try:
+            convert_kwargs["request_options"] = {
+                "timeout_in_seconds": int(elevenlabs_config["timeout_seconds"]),
+            }
+        except (TypeError, ValueError):
+            logger.warning("Invalid stt.elevenlabs.timeout_seconds value; omitting it")
+
+    try:
+        from elevenlabs.client import ElevenLabs
+
+        client = ElevenLabs(api_key=api_key)
+        with open(file_path, "rb") as audio_file:
+            result = client.speech_to_text.convert(
+                file=(Path(file_path).name, audio_file),
+                **convert_kwargs,
+            )
+
+        transcript_text = _extract_transcript_text(result)
+        logger.info(
+            "Transcribed %s via ElevenLabs Scribe (%s, %d chars)",
+            Path(file_path).name,
+            model_name,
+            len(transcript_text),
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "elevenlabs"}
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("ElevenLabs transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"ElevenLabs transcription failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
 # Provider: xAI (Grok STT API)
 # ---------------------------------------------------------------------------
 
@@ -859,6 +943,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
         return _transcribe_mistral(file_path, model_name)
 
+    if provider == "elevenlabs":
+        elevenlabs_cfg = stt_config.get("elevenlabs", {})
+        model_name = model or elevenlabs_cfg.get("model", DEFAULT_ELEVENLABS_STT_MODEL)
+        return _transcribe_elevenlabs(file_path, model_name)
+
     if provider == "xai":
         # xAI Grok STT doesn't use a model parameter — pass through for logging
         model_name = model or "grok-stt"
@@ -872,7 +961,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
+            "Voxtral Transcribe, set ELEVENLABS_API_KEY for ElevenLabs Scribe, "
+            "set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
             "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }
